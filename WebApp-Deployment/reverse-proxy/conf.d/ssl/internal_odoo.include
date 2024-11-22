@@ -1,0 +1,3 @@
+ssl_certificate /etc/nginx/certs/self-signed/odoo_Certificate.crt;
+ssl_certificate_key /etc/nginx/certs/self-signed/odoo_Certificate.key;
+

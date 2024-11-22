@@ -1,0 +1,22 @@
+[submodule "odoo-prod/source"]
+	path = odoo-prod/source
+	url = https://github.com/Hoschoc/odooBundle-Codebase.git
+	branch = production
+	shallow = true
+[submodule "odoo-dev/source"]
+	path = odoo-dev/source
+	url = https://github.com/Hoschoc/odooBundle-Codebase.git
+	branch = development
+	shallow = true
+[submodule "static-brand/source"]
+	path = static-brand/source
+	url = https://github.com/Hoschoc/StaticBrand.git
+	shallow = true
+[submodule "volumerize/source"]
+	path = volumerize/source
+	url = https://github.com/WildfootW/volumerize.git
+	shallow = true
+[submodule "fail2ban/source"]
+	path = fail2ban/source
+	url = https://github.com/WildfootW/docker-fail2ban
+	shallow = true

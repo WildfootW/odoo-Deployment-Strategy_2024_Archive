@@ -1,0 +1,82 @@
+# This docker-compose file is designed for development and testing purposes, specifically to test the integration of Odoo with the custom Dockerfile in this repository. It allows for quick testing of Odoo itself and any custom Odoo modules included.
+#
+# **Note**: This setup is not intended for production deployment.
+
+# Odoo does not natively support splitting configuration files or securely managing the `admin_passwd` via environment variables. To address this limitation, we use the# `CONF_OVERRIDE_WITH_SECURE` environment variable to handle sensitive settings.
+#
+# When `CONF_OVERRIDE_WITH_SECURE` is set to "true":
+#
+# 1. You must bind both the general and sensitive configuration files to these paths:
+#    - General config: /etc/odoo/odoo-general.conf
+#    - Sensitive config: /etc/odoo/odoo-sensitive.conf
+#
+# 2. At runtime, these files are merged into a single `/etc/odoo/odoo.conf` file, overriding existing odoo.conf
+#
+# Ensure sensitive files are never included in version control.
+
+services:
+  postgresql:
+    image: postgres:16.4
+    restart: always
+    networks:
+      - odoo-net
+    environment:
+      - POSTGRES_DB=postgres # can't modify due to issue: https://github.com/odoo/odoo/issues/182551
+      - POSTGRES_USER=odoo_user
+      - POSTGRES_PASSWORD=JXPF9aDZeZWlrDpf
+    volumes:
+      # Persist data for the production PostgreSQL instance
+      - db-data:/var/lib/postgresql/data
+
+  odoo:
+    build: .
+    restart: always
+    depends_on:
+      - postgresql
+    networks:
+      - odoo-net
+    ports:
+      - "8069:8069" # Expose Odoo's main HTTP service port for accessing the web interface.
+      - "8071:8071" # Expose XML-RPC over HTTPS for secure external integrations.
+      - "8072:8072" # Expose long-polling port for real-time features like chat notifications.
+    environment:
+      # PostgreSQL Development Environment Variables
+      - POSTGRES_HOST=postgresql
+      - POSTGRES_USER=odoo_user
+      - POSTGRES_PASSWORD=JXPF9aDZeZWlrDpf
+      - CONF_OVERRIDE_WITH_SECURE=true  # Set to enable merging of config files
+    volumes:
+      # Persist logs for the production Odoo instance
+      - odoo-data:/var/lib/odoo
+
+      - ./odoo-general.conf:/etc/odoo/odoo-general.conf  # General config file
+      - ./odoo-sensitive.conf:/etc/odoo/odoo-sensitive.conf  # Sensitive config file with passwords
+#      - ./odoo.conf:/etc/odoo/odoo.conf  # Dev: Mount odoo.conf for easy config changes (won't be used while CONF_OVERRIDE_WITH_SECURE is set to true)
+
+#      - ./odoo:/usr/src/app/odoo  # Dev: Mount Odoo source for live code changes
+#      - ./addons:/opt/odoo/addons  # Dev: Mount custom addons for development
+      - ./tutorials:/opt/odoo/tutorials  # Tutorial: Mount tutorials directory inside container
+
+  postgresql-admin:
+    image: dpage/pgadmin4:8.10
+    restart: always
+    networks:
+      - odoo-net
+    ports:
+      - "8080:80" # Expose pgadmin's HTTP service port
+    environment:
+      - PGADMIN_DEFAULT_EMAIL=odoo-db@example.com
+      - PGADMIN_DEFAULT_PASSWORD=K3dL9tew3FX7fQvM
+    volumes:
+      - db-admin-data:/var/lib/pgadmin # Persist pgAdmin's configuration data
+
+networks:
+  odoo-net:
+    driver: bridge
+
+volumes:
+  db-data: # database persisti data
+  odoo-data: # odoo persist data like filestore, sessions, etc.
+  db-admin-data: # pgAdmin persist data
+
+

@@ -1,0 +1,9 @@
+[odoo-prod-login]
+enabled = true
+filter = odoo-login
+port = http,https
+bantime = 900  ; 15 min ban
+maxretry = 10  ; if 10 attempts
+findtime = 60  ; within 60s
+chain = DOCKER-USER
+logpath = /var/log/odoo-prod/odoo.log

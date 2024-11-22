@@ -1,0 +1,83 @@
+在使用 odoo 時，`odoo.conf` 這個設定檔非常重要。它包含了系統運行所需的各種設定，例如資料庫連線資訊、伺服器參數等。這邊附上官方 Docker 映像檔中預設的 [odoo.conf](https://github.com/odoo/docker/blob/master/17.0/odoo.conf)。
+
+一開始發現問題是因為我注意到一個設定值：`admin_passwd`。這個密碼非常關鍵，因為它允許任意人在不需要登入使用者的情況下，直接進入 `/web/database/manager`，對資料庫進行備份、刪除、修改等操作。
+
+此外，`odoo.conf` 也包含了資料庫連線的密碼等敏感資訊。不過，資料庫的連線資訊可以在啟動 odoo 時，透過參數的方式傳入，但 `admin_passwd` 卻無法這麼做，這很棘手。在 GitHub 和 StackOverflow 上也有人提到這個問題，但目前似乎還沒有解決方案：[GitHub - No way to set master password via environment](https://github.com/odoo/docker/issues/112)、[StackOverflow - How to make odoo read admin_passwd from file?](https://stackoverflow.com/questions/43341273/how-to-make-odoo-read-admin-passwd-from-file)。
+
+因此我只好自力更生了。考慮了幾個方案：
+
+1. **使用 `.gitignore` 忽略整個設定檔**：但 `odoo.conf` 還包含其他有用的設定，每次重新 clone 都需要重新設定，其他的設定也變成每次都要重設。
+
+2. **透過 odoo 介面設定密碼**：這會以雜湊的方式將密碼寫入設定檔，避免明碼儲存。但我仍然希望將這類敏感設定移至專門的 `config` 資料夾，並且我不想在不同的佈署中共用這個設定。
+
+3. **使用 Docker Secrets 或外部秘密管理工具**：搜尋時，在 GitHub 上看到有人採用這種方法，建立一個 `odoo.conf.template`，其中包含 `admin_passwd = ${ADMIN_PASSWD}`，再利用其他軟體填入實際的值，例如 Docker Compose 的變數替換功能或秘密管理工具如 HashiCorp Vault。
+
+4. **使用上一章提到的 `git-secret` 或 `git-crypto`**：這與第二種方法類似。
+
+最後，我選擇繼續採用一個土炮但有效的方式──將 `odoo.conf` 分成兩個部分：將敏感資訊放入 `odoo-dev-sensitive.conf`，存放在 `config` 資料夾中；一般設定則放在 `odoo-general.conf`，置於 `odoo-dev` 容器的設定資料夾中。
+
+接著，在 `entrypoint.sh` 中新增一個功能：只要偵測到我設定的環境變數 `CONF_OVERRIDE_WITH_SECURE`，就在啟動 odoo 前，將這兩個檔案合併，並覆蓋原本 docker image build 時放入的 `odoo.conf`。
+
+### entrypoint.sh 新增的合併功能
+
+我新增了一個名為 `combine_general_and_sensitive_configs` 的 function，用來合併一般設定檔與敏感設定檔。
+
+    function combine_general_and_sensitive_configs() {
+        if [ "$CONF_OVERRIDE_WITH_SECURE" == "true" ]; then
+            echo "$HEADER CONF_OVERRIDE_WITH_SECURE is set to 'true'. Proceeding with config merge..."
+
+            # 確認一般設定檔與敏感設定檔都存在，才進行合併
+            if [ -f /etc/odoo/odoo-general.conf ] && [ -f /etc/odoo/odoo-sensitive.conf ]; then
+                echo "$HEADER Found both general and sensitive config files."
+                cat /etc/odoo/odoo-general.conf /etc/odoo/odoo-sensitive.conf > /etc/odoo/odoo.conf
+                echo "$HEADER Config files merged into /etc/odoo/odoo.conf"
+            else
+                # 若有任一設定檔缺少，則顯示錯誤訊息並中止程序
+                echo "$HEADER Error: One or both of the config files are missing. Merge aborted."
+                exit 1
+            fi
+
+        # 若 CONF_OVERRIDE_WITH_SECURE 未設定，則使用預設的設定檔
+        elif [ -z "$CONF_OVERRIDE_WITH_SECURE" ]; then
+            echo "$HEADER CONF_OVERRIDE_WITH_SECURE is not set. Using default config."
+        else
+            # 若 CONF_OVERRIDE_WITH_SECURE 設定了無效的值，則顯示警告並使用預設的設定
+            echo "$HEADER Warning: CONF_OVERRIDE_WITH_SECURE is set to an invalid value. Using default config."
+        fi
+    }
+
+這段程式碼會在 `CONF_OVERRIDE_WITH_SECURE` 設定為 `true` 時，合併 `/etc/odoo/odoo-general.conf` 與 `/etc/odoo/odoo-sensitive.conf`，並覆蓋原本的 `odoo.conf`。如此一來，讓一般設定與敏感設定可以分開管理，並且在啟動前進行動態合併。
+
+### docker-compose 設定
+
+接下來，只要在 `docker-compose.yml` 做下面的設定，就可以啟動這個合併機制。
+
+    environment:
+      - CONF_OVERRIDE_WITH_SECURE=true  # 設定此環境變數來啟動設定檔合併機制
+    volumes:
+      - ./odoo-dev/odoo-general.conf:/etc/odoo/odoo-general.conf  # 一般設定檔
+      - ./config/odoo-dev-sensitive.conf:/etc/odoo/odoo-sensitive.conf  # 敏感設定檔，包含密碼等資訊
+
+這樣的設定可以確保 `odoo.conf` 在不同的佈署環境下依據實際需求進行合併，也能避免將敏感資訊暴露在不應該的地方。
+※ 小提示：如果將 `admin_passwd` 設定為 `admin`，odoo 會直接當作沒設密碼，進入管理資料庫的頁面還是會跳出設定密碼的提示，這很違反直覺，害我多研究了快兩個小時。
+
+### odoo.conf 範例與結構
+
+為了讓整個設定檔更有條理，我自己編排了一個 [odoo.conf 範例檔案](https://github.com/WildfootW/odoo.conf-sample/blob/main/odoo.conf)，並將設定檔分為幾個章節。
+
+    ; 1. Addons and Data Directories
+    ; 2. Database Settings
+    ; 3. Interface and Ports
+    ; 4. Logging Settings
+    ; 5. Email Settings
+    ; 6. Performance and Limits
+    ; 7. Internationalization
+    ; 8. Testing and Debugging
+    ; 9. Sensitive Settings (to be placed at the end of the file)
+    ;    9.1 Database Connection Settings
+    ;    9.2 SMTP Settings
+    ;    9.3 Admin Password
+
+如此一來，這些設定的功能就更清楚明白，將敏感設定放在檔案的最後面也方便檔案合併，不過這些設定我也還沒全部搞明白，只是先將確定有的設定放入其中並註解起來，大家可以一起改善這個範例檔案，後面也許也會有章節來介紹其中的一些設定值。
+
+

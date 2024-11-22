@@ -1,0 +1,206 @@
+這兩天去高雄拍音樂祭，本來今天預計來做 Fail2ban ，但是車上網路實在太爛沒辦法實驗，只好延後熬夜了。
+
+> 這個實踐方式會修改主機的 iptables，不同的主機環境需要各自進行調整，以下是在 Ubuntu 22.04.5 LTS 上進行的測試。
+
+### iptables / Fail2ban 的運作方式
+iptables 使用鏈（Chain）來組織規則，每個鏈包含一系列按照順序執行的規則。常見的鏈有 INPUT、OUTPUT、FORWARD，以及自定義的鏈。`DOCKER-USER` 就是 Docker 在啟動時會自動創建的自定義鏈，允許使用者在其中添加自定義規則，並在所有 Docker 容器的流量處理前執行。而我們這次實踐 **Fail2ban** 的方式就是讓其在 `DOCKER-USER` 鏈中插入了自己的規則，用於封鎖違規的 IP 地址。
+
+- **iptables 規則匹配流程：**
+  - 當封包進入鏈時，iptables 會從上到下逐一檢查規則。
+  - 如果封包匹配某條規則，則執行該規則定義的動作（如 ACCEPT、DROP、RETURN 等）。
+  - 若封包未匹配任何規則，則按照鏈的預設策略處理。
+
+- **iptables 規則欄位解釋：**
+  - **pkts**：匹配此規則的封包數量。
+  - **bytes**：匹配此規則的總位元組數量。
+  - **target**：當封包匹配規則時要執行的動作。
+  - **prot**：協議，如 tcp、udp、all 等，z.B. TCP（`prot tcp`）。
+  - **opt**：選項，一般為 `--`。
+  - **in**：封包進入的網路介面。
+  - **out**：封包發送的網路介面。
+  - **source**：封包的來源 IP，z.B. 來源可以是任何 IP（`source 0.0.0.0/0`）。
+  - **destination**：封包的目的地 IP。
+  - 目標埠為 80 或 443（`multiport dports 80,443`）。
+
+### 直接測試 fail2ban 容器
+
+這裡採用 [Crazy-Max 維護的 Docker-Fail2ban](https://github.com/crazy-max/docker-fail2ban)。測試的方法很簡單，首先在某個目錄下建立以下檔案結構：
+
+    .
+    ├── data
+    │   ├── filter.d
+    │   │   └── test-ban.conf
+    │   └── jail.d
+    │       └── test-jail.local
+    └── test-ban.log
+
+**編輯 `./data/filter.d/test-ban.conf`：**
+
+    [Definition]
+    failregex = <HOST> - testban
+    ignoreregex =
+
+這個設定定義了 `fail2ban` 的過濾規則，其中 `<HOST>` 代表被封鎖的 IP 位址，`failregex` 用於匹配日誌中特定的格式的字串。
+
+**編輯 `./data/jail.d/test-jail.local`：**
+
+    [test-jail]
+    enabled = true
+    filter = test-ban
+    logpath = /var/log/test-ban.log
+    maxretry = 1
+    bantime = 600
+    chain = DOCKER-USER
+    port = http,https
+
+這個設定檔定義了一個名為 `test-jail` 的監獄（jail），指定使用的過濾器為 `test-ban`，監控的日誌路徑為 `/var/log/test-ban.log`，`maxretry` 設為 1，表示發生一次違規就會被封鎖，`bantime` 設為 600 秒（10 分鐘）。
+
+**建立容器：**
+
+    docker run --name fail2ban --restart always --network host --cap-add NET_ADMIN --cap-add NET_RAW \
+      -e TZ=Asia/Taipei \
+      -v $(pwd)/data:/data \
+      -v $(pwd)/test-ban.log:/var/log/test-ban.log \
+      crazymax/fail2ban:latest
+
+- `--network host`：使用主機的網路配置。
+- `--cap-add NET_ADMIN --cap-add NET_RAW`：賦予容器操作網路配置的權限。
+
+**在被封鎖前測試連線：**
+
+    curl http://odoo.internal.example.com
+
+得到以下回應，表示連線正常：
+
+    <html>
+    <head><title>301 Moved Permanently</title></head>
+    <body>
+    <center><h1>301 Moved Permanently</h1></center>
+    <hr><center>nginx/1.27.2</center>
+    </body>
+    </html>
+
+**模擬違規行為，觸發封鎖：**
+
+    echo "192.168.77.7 - testban" | tee -a ./test-ban.log
+
+這行指令將模擬一個違規日誌，寫入到 `test-ban.log`，觸發 `fail2ban` 的規則。
+
+**查看容器日誌，確認封鎖：**
+
+    2024-11-05 21:28:44,427 fail2ban.filter         [1]: INFO    [test-jail] Found 192.168.77.7 - 2024-11-05 21:28:44
+    2024-11-05 21:28:44,622 fail2ban.actions        [1]: NOTICE  [test-jail] Ban 192.168.77.7
+
+從日誌中可以看到，`fail2ban` 發現了違規的 IP 並進行了封鎖。
+
+**在主機上查看 iptables 規則：**
+
+    sudo iptables -L DOCKER-USER -n -v
+
+這個指令會列出名為 `DOCKER-USER` 的鏈（Chain）中的所有規則。iptables 中的鏈是一組防火牆規則的集合，用於控制網路封包的處理流程。
+
+**輸出結果：**
+
+    Chain DOCKER-USER (1 references)
+     pkts bytes target         prot opt in     out     source               destination
+      130 11402 f2b-test-jail  tcp  --  *      *       0.0.0.0/0            0.0.0.0/0            multiport dports 80,443
+    1072K  543M RETURN         all  --  *      *       0.0.0.0/0            0.0.0.0/0
+
+  - 當封包匹配第一條規則（目標埠為 80 或 443），會跳轉到 `f2b-test-jail` 鏈。在這個鏈中，Fail2ban 會檢查封包的來源 IP 是否在封鎖名單中。
+  - 如果 IP 被封鎖，則封包會被拒絕（DROP）。
+  - 如果 IP 未被封鎖，則封包會返回（RETURN）繼續後續的處理。
+  - 第二條規則確保所有未被前面規則處理的封包返回上層鏈，繼續正常的網路流程。
+
+**再次嘗試連線，確認被封鎖：**
+
+    curl http://odoo.internal.example.com
+    curl: (7) Failed to connect to odoo.internal.example.com port 80 after 3205 ms: Connection refused
+
+連線失敗，表示 IP 已被封鎖。
+
+**確認被封鎖的 IP 和狀態：**
+
+    docker exec -it fail2ban fail2ban-client status test-jail
+
+輸出結果：
+
+    Status for the jail: test-jail
+    |- Filter
+    |  |- Currently failed: 0
+    |  |- Total failed:     1
+    |  `- File list:        /var/log/test-ban.log
+    `- Actions
+       |- Currently banned: 1
+       |- Total banned:     1
+       `- Banned IP list:   192.168.77.7
+
+這表示 IP `192.168.77.7` 已被 `fail2ban` 封鎖。
+
+### 整合 fail2ban 容器
+首先一樣建立一個 fail2ban 的資料夾，進去裡面後新增 submodule
+```
+git submodule add https://github.com/crazy-max/docker-fail2ban source
+```
+
+新增 `filter.d` 子資料夾並建立檔案 `odoo-login.conf`
+```
+[Definition]
+# Regex to match failed login attempts in odoo logs
+failregex = ^ \d+ INFO \S+ \S+ Login failed for db:\S+ login:\S+ from <HOST>
+# Regex to ignore certain patterns (empty in this case)
+ignoreregex =
+```
+
+新增 `jail.d` 子資料夾並建立檔案 `odoo-dev.local`
+```
+[odoo-dev-login]
+enabled = true
+filter = odoo-login
+port = http,https
+bantime = 900  ; 15 min ban
+maxretry = 10  ; if 10 attempts
+findtime = 60  ; within 60s
+chain = DOCKER-USER
+logpath = /var/log/odoo-dev/odoo.log
+```
+
+最後編輯 docker-compose 加入 `fail2ban` 容器，就可以跑起來了。
+```
+  fail2ban:
+    build: ./fail2ban/source
+    restart: always
+    profiles:
+      - deployment
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    volumes:
+      - ./fail2ban/filter.d:/data/filter.d:ro
+      - ./fail2ban/jail.d:/data/jail.d:ro
+      - ./odoo-dev/logs:/var/log/odoo-dev:ro
+    environment:
+      - TZ=UTC
+    network_mode: host # Use host network mode to allow direct access to the host's network for monitoring and firewall management.
+```
+
+檢查下 iptables
+```
+sudo iptables -L DOCKER-USER -n -v
+Chain DOCKER-USER (1 references)
+ pkts bytes target     prot opt in     out     source               destination
+  757 74507 f2b-odoo-dev-login  tcp  --  *      *       0.0.0.0/0            0.0.0.0/0            multiport dports 80,443
+3875K 1154M RETURN     all  --  *      *       0.0.0.0/0            0.0.0.0/0
+```
+
+直接測試輸入十次錯誤密碼。
+```
+fail2ban-1  | 2024-11-16 18:42:50,125 fail2ban.filter         [1]: INFO    [odoo-dev-login] Found 10.65.110.3 - 2024-11-16 18:42:50
+```
+出現十次後，接著就是 ip 被封鎖了。
+```
+fail2ban-1  | 2024-11-16 18:42:50,542 fail2ban.actions        [1]: NOTICE  [odoo-dev-login] Ban 10.65.110.3
+```
+網頁會顯示無法連線。
+![https://ithelp.ithome.com.tw/upload/images/20241117/20168935qV8VsPhOg4.png](https://ithelp.ithome.com.tw/upload/images/20241117/20168935qV8VsPhOg4.png)
+
+
